@@ -7,7 +7,8 @@ import {
   Platform, 
   Image,
   Alert,
-  TouchableOpacity 
+  TouchableOpacity,
+  Modal
 } from 'react-native';
 import { 
   TextInput, 
@@ -15,7 +16,9 @@ import {
   Headline, 
   HelperText, 
   ActivityIndicator,
-  IconButton
+  IconButton,
+  Text,
+  Chip
 } from 'react-native-paper';
 import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
 import { StackNavigationProp } from '@react-navigation/stack';
@@ -23,6 +26,9 @@ import { useProductStore } from '../../store/productStore';
 import * as ImagePicker from 'expo-image-picker';
 import { Camera } from 'expo-camera';
 import { BarCodeScanner } from 'expo-barcode-scanner';
+import ProductClassifier from '../../components/ai/ProductClassifier';
+import ProductRecognition from '../../components/ai/ProductRecognition';
+import { findSimilarProducts, RecognitionResult } from '../../services/productAIService';
 
 // Definimos los tipos para la navegación y route
 type ProductsStackParamList = {
@@ -40,7 +46,7 @@ const ProductFormScreen = () => {
   const { productId } = route.params || {};
   const isEditing = !!productId;
 
-  const { products, isLoading, error, addProduct, updateProduct } = useProductStore();
+  const { products, isLoading, error, addProduct, updateProduct, getCategories } = useProductStore();
 
   // Estados del formulario
   const [name, setName] = useState('');
@@ -61,6 +67,15 @@ const ProductFormScreen = () => {
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
 
+  // Estados para la funcionalidad de IA
+  const [isAIClassifierOpen, setIsAIClassifierOpen] = useState(false);
+  const [isAIResultsOpen, setIsAIResultsOpen] = useState(false);
+  const [aiRecognitionResult, setAIRecognitionResult] = useState<RecognitionResult | null>(null);
+  const [category, setCategory] = useState('');
+  const [availableCategories, setAvailableCategories] = useState<string[]>([]);
+  const [showDuplicateWarning, setShowDuplicateWarning] = useState(false);
+  const [duplicateProducts, setDuplicateProducts] = useState<Array<{id: number, name: string, similarity: number, price: number}>>([]);
+
   // Si estamos editando, cargar datos del producto
   useEffect(() => {
     if (isEditing && productId) {
@@ -71,11 +86,24 @@ const ProductFormScreen = () => {
         setPrice(productToEdit.price.toString());
         setCost(productToEdit.cost?.toString() || '');
         setStock(productToEdit.stock.toString());
-        setImage(productToEdit.image || null);
+        setImage(productToEdit.image_url || null);
         setBarcode(productToEdit.barcode || '');
+        setCategory(productToEdit.category || '');
       }
     }
+
+    // Cargar categorías disponibles
+    loadCategories();
   }, [isEditing, productId, products]);
+
+  const loadCategories = async () => {
+    try {
+      const categories = await getCategories();
+      setAvailableCategories(categories);
+    } catch (error) {
+      console.error('Error al cargar categorías:', error);
+    }
+  };
 
   // Solicitar permisos de la cámara
   useEffect(() => {
@@ -171,6 +199,79 @@ const ProductFormScreen = () => {
     setIsScannerOpen(false);
   };
 
+  // Funciones para IA y reconocimiento
+  const handleOpenAIClassifier = () => {
+    setIsAIClassifierOpen(true);
+  };
+
+  const handleProductClassified = async (result: RecognitionResult) => {
+    setAIRecognitionResult(result);
+    setIsAIClassifierOpen(false);
+    
+    // Si hay una imagen capturada, buscar productos similares
+    if (image) {
+      try {
+        const similarProductsResult = await findSimilarProducts(image, products);
+        
+        // Verificar si hay productos muy similares (posibles duplicados)
+        const highSimilarityProducts = similarProductsResult.similarProducts?.filter(
+          p => p.similarity > 0.8
+        ) || [];
+        
+        if (highSimilarityProducts.length > 0) {
+          setShowDuplicateWarning(true);
+          setDuplicateProducts(highSimilarityProducts);
+        }
+        
+        setAIRecognitionResult(similarProductsResult);
+      } catch (error) {
+        console.error('Error al buscar productos similares:', error);
+      }
+    }
+    
+    setIsAIResultsOpen(true);
+  };
+
+  const handleUseAIResult = (suggestedName: string, suggestedPrice: number, suggestedCategory: string) => {
+    setName(suggestedName);
+    setPrice(suggestedPrice.toString());
+    setCategory(suggestedCategory);
+    setIsAIResultsOpen(false);
+  };
+
+  const checkForDuplicates = async () => {
+    if (!name || !image) return;
+    
+    // Buscar productos con nombres similares
+    const nameMatches = products.filter(p => 
+      p.name.toLowerCase().includes(name.toLowerCase()) || 
+      name.toLowerCase().includes(p.name.toLowerCase())
+    );
+    
+    if (nameMatches.length > 0) {
+      setShowDuplicateWarning(true);
+      setDuplicateProducts(nameMatches.map(p => ({
+        id: p.id,
+        name: p.name,
+        similarity: 0.9, // Alta similitud para nombres que coinciden
+        price: p.price
+      })));
+    } else if (image) {
+      // Si no hay coincidencias por nombre, intentar reconocimiento visual
+      try {
+        const result = await findSimilarProducts(image, products);
+        const highSimilarityProducts = result.similarProducts?.filter(p => p.similarity > 0.7) || [];
+        
+        if (highSimilarityProducts.length > 0) {
+          setShowDuplicateWarning(true);
+          setDuplicateProducts(highSimilarityProducts);
+        }
+      } catch (error) {
+        console.error('Error al verificar duplicados visuales:', error);
+      }
+    }
+  };
+
   // Guardar el producto
   const handleSave = async () => {
     const isNameValid = validateName();
@@ -178,19 +279,29 @@ const ProductFormScreen = () => {
     const isStockValid = validateStock();
 
     if (isNameValid && isPriceValid && isStockValid) {
+      // Verificar duplicados antes de guardar
+      await checkForDuplicates();
+      
+      // Si hay duplicados, mostrar una advertencia pero permitir guardar
+      if (showDuplicateWarning) {
+        // Continuar con la acción de guardar después de mostrar la advertencia
+        return;
+      }
+      
       const productData = {
         name,
         description,
         price: parseFloat(price),
         cost: cost ? parseFloat(cost) : undefined,
         stock: parseInt(stock),
-        image,
-        barcode
+        image_url: image,
+        barcode,
+        category
       };
 
       let result;
       if (isEditing && productId) {
-        result = await updateProduct(productId, productData);
+        result = await updateProduct({...productData, id: productId});
       } else {
         result = await addProduct(productData);
       }
@@ -198,6 +309,33 @@ const ProductFormScreen = () => {
       if (result) {
         navigation.goBack();
       }
+    }
+  };
+
+  // Confirmar guardar a pesar de posibles duplicados
+  const confirmSaveDespiteDuplicates = async () => {
+    setShowDuplicateWarning(false);
+    
+    const productData = {
+      name,
+      description,
+      price: parseFloat(price),
+      cost: cost ? parseFloat(cost) : undefined,
+      stock: parseInt(stock),
+      image_url: image,
+      barcode,
+      category
+    };
+
+    let result;
+    if (isEditing && productId) {
+      result = await updateProduct({...productData, id: productId});
+    } else {
+      result = await addProduct(productData);
+    }
+
+    if (result) {
+      navigation.goBack();
     }
   };
 
@@ -265,6 +403,24 @@ const ProductFormScreen = () => {
         <Headline style={styles.title}>
           {isEditing ? 'Editar Producto' : 'Nuevo Producto'}
         </Headline>
+        
+        {/* Botón de análisis con IA */}
+        {!isEditing && (
+          <View style={styles.aiButtonContainer}>
+            <Button
+              mode="contained"
+              icon="brain"
+              onPress={handleOpenAIClassifier}
+              style={styles.aiButton}
+              labelStyle={styles.aiButtonLabel}
+            >
+              Analizar con IA
+            </Button>
+            <Text style={styles.aiHelperText}>
+              Usa la IA para detectar y clasificar el producto automáticamente
+            </Text>
+          </View>
+        )}
 
         <TextInput
           label="Nombre del producto *"
@@ -321,6 +477,33 @@ const ProductFormScreen = () => {
           error={!!stockError}
         />
         {!!stockError && <HelperText type="error">{stockError}</HelperText>}
+
+        <TextInput
+          label="Categoría"
+          value={category}
+          onChangeText={setCategory}
+          mode="outlined"
+          style={styles.input}
+        />
+        
+        {availableCategories.length > 0 && (
+          <ScrollView 
+            horizontal 
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.categoriesContainer}
+          >
+            {availableCategories.map((cat, index) => (
+              <Chip
+                key={index}
+                selected={category === cat}
+                onPress={() => setCategory(cat)}
+                style={styles.categoryChip}
+              >
+                {cat}
+              </Chip>
+            ))}
+          </ScrollView>
+        )}
 
         <View style={styles.barcodeContainer}>
           <TextInput
@@ -401,6 +584,82 @@ const ProductFormScreen = () => {
         </View>
 
         {error && <HelperText type="error">{error}</HelperText>}
+        
+        {/* Modal de clasificación de productos con IA */}
+        <Modal
+          visible={isAIClassifierOpen}
+          animationType="slide"
+          onRequestClose={() => setIsAIClassifierOpen(false)}
+        >
+          <ProductClassifier
+            onProductClassified={handleProductClassified}
+            onClose={() => setIsAIClassifierOpen(false)}
+          />
+        </Modal>
+        
+        {/* Modal de resultados de reconocimiento */}
+        <Modal
+          visible={isAIResultsOpen && !!aiRecognitionResult}
+          animationType="slide"
+          onRequestClose={() => setIsAIResultsOpen(false)}
+        >
+          {aiRecognitionResult && (
+            <ProductRecognition
+              result={aiRecognitionResult}
+              onUseResult={handleUseAIResult}
+              onClose={() => setIsAIResultsOpen(false)}
+            />
+          )}
+        </Modal>
+        
+        {/* Modal de advertencia de posibles duplicados */}
+        <Modal
+          visible={showDuplicateWarning}
+          animationType="fade"
+          transparent
+          onRequestClose={() => setShowDuplicateWarning(false)}
+        >
+          <View style={styles.modalBackground}>
+            <View style={styles.modalContent}>
+              <Text style={styles.modalTitle}>Productos similares detectados</Text>
+              <Text style={styles.modalText}>
+                Encontramos productos que parecen similares al que estás intentando {isEditing ? 'editar' : 'agregar'}:
+              </Text>
+              
+              <ScrollView style={styles.duplicatesList}>
+                {duplicateProducts.map((product, index) => (
+                  <View key={index} style={styles.duplicateItem}>
+                    <Text style={styles.duplicateName}>{product.name}</Text>
+                    <Text style={styles.duplicateInfo}>
+                      Precio: S/ {product.price.toFixed(2)} • Similitud: {Math.round(product.similarity * 100)}%
+                    </Text>
+                  </View>
+                ))}
+              </ScrollView>
+              
+              <Text style={styles.modalQuestion}>
+                ¿Deseas continuar y {isEditing ? 'actualizar' : 'registrar'} este producto de todas formas?
+              </Text>
+              
+              <View style={styles.modalButtons}>
+                <Button
+                  mode="outlined"
+                  onPress={() => setShowDuplicateWarning(false)}
+                  style={[styles.modalButton, styles.cancelButton]}
+                >
+                  Modificar datos
+                </Button>
+                <Button
+                  mode="contained"
+                  onPress={confirmSaveDespiteDuplicates}
+                  style={[styles.modalButton, styles.confirmButton]}
+                >
+                  Continuar
+                </Button>
+              </View>
+            </View>
+          </View>
+        </Modal>
       </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -421,8 +680,36 @@ const styles = StyleSheet.create({
     marginBottom: 16,
     color: '#1E88E5',
   },
+  aiButtonContainer: {
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  aiButton: {
+    width: '100%',
+    borderRadius: 8,
+    backgroundColor: '#7B1FA2', // Color morado para diferenciarlo
+  },
+  aiButtonLabel: {
+    fontSize: 16,
+    paddingVertical: 4,
+  },
+  aiHelperText: {
+    fontSize: 12,
+    color: '#757575',
+    marginTop: 4,
+    textAlign: 'center',
+  },
   input: {
     marginBottom: 12,
+  },
+  categoriesContainer: {
+    flexDirection: 'row',
+    marginBottom: 16,
+    paddingVertical: 4,
+  },
+  categoryChip: {
+    marginRight: 8,
+    marginBottom: 8,
   },
   barcodeContainer: {
     flexDirection: 'row',
@@ -494,6 +781,69 @@ const styles = StyleSheet.create({
   },
   cameraButton: {
     marginBottom: 30,
+  },
+  modalBackground: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    backgroundColor: 'white',
+    borderRadius: 8,
+    padding: 20,
+    width: '100%',
+    maxHeight: '80%',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 12,
+    color: '#F44336',
+  },
+  modalText: {
+    fontSize: 14,
+    marginBottom: 12,
+    lineHeight: 20,
+  },
+  modalQuestion: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    marginTop: 16,
+    marginBottom: 12,
+  },
+  duplicatesList: {
+    maxHeight: 200,
+    marginVertical: 8,
+  },
+  duplicateItem: {
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#e0e0e0',
+    borderRadius: 4,
+    marginBottom: 8,
+  },
+  duplicateName: {
+    fontWeight: 'bold',
+    fontSize: 14,
+  },
+  duplicateInfo: {
+    fontSize: 12,
+    color: '#757575',
+    marginTop: 4,
+  },
+  modalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 16,
+  },
+  modalButton: {
+    marginLeft: 8,
+    minWidth: 100,
+  },
+  confirmButton: {
+    backgroundColor: '#F44336',
   },
 });
 
